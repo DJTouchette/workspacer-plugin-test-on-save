@@ -1,0 +1,57 @@
+{
+  "id": "djtouchette.test-on-save",
+  "name": "Test on Save",
+  "apiVersion": "1",
+  "server": {
+    "command": "node",
+    "args": [
+      "server.js"
+    ],
+    "port": 9207,
+    "health": "/health"
+  },
+  "panes": [
+    {
+      "type": "djtouchette.test-on-save",
+      "title": "Test on Save",
+      "icon": "\ud83e\uddea",
+      "scope": "agent",
+      "path": "/"
+    }
+  ],
+  "settings": [
+    {
+      "key": "testCommand",
+      "label": "Test command",
+      "type": "string",
+      "default": "npm test",
+      "help": "Command run on change."
+    },
+    {
+      "key": "debounceMs",
+      "label": "Debounce (ms)",
+      "type": "number",
+      "default": 1500,
+      "help": "Wait this long after the last change before running."
+    }
+  ],
+  "capabilities": [
+    {
+      "method": "fs.watch",
+      "paths": [
+        "${agentCwd}"
+      ]
+    },
+    {
+      "method": "search.project",
+      "paths": [
+        "${agentCwd}"
+      ]
+    },
+    "agents.sendMessage",
+    "notifications.post"
+  ],
+  "consumes": [
+    "fs.changed"
+  ]
+}
