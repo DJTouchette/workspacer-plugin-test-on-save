@@ -52,6 +52,8 @@
     "notifications.post"
   ],
   "consumes": [
-    "fs.changed"
+    "fs.changed",
+    "agent.state_changed",
+    "agent.snapshot"
   ]
 }
