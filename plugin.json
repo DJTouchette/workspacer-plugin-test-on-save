@@ -36,18 +36,6 @@
     }
   ],
   "capabilities": [
-    {
-      "method": "fs.watch",
-      "paths": [
-        "${agentCwd}"
-      ]
-    },
-    {
-      "method": "search.project",
-      "paths": [
-        "${agentCwd}"
-      ]
-    },
     "agents.sendMessage",
     "notifications.post"
   ],

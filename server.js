@@ -71,10 +71,16 @@ function connect() {
 // ── test-on-save logic ────────────────────────────────────────────────────────
 //
 // Flow: learn each live agent's cwd from `agent.state_changed` (and
-// `agent.snapshot`), watch that working tree via `fs.watch`, and when a source
-// file under it changes, debounce per-cwd then run `settings.testCommand` in the
-// cwd. On a non-zero exit we push the failing tail back to the owning agent with
+// `agent.snapshot`), watch that working tree, and when a source file under it
+// changes, debounce per-cwd then run `settings.testCommand` in the cwd. On a
+// non-zero exit we push the failing tail back to the owning agent with
 // `agents.sendMessage` and raise an OS notification via `notifications.post`.
+//
+// Watching is done LOCALLY with node's recursive fs.watch: the sidecar runs on
+// the same host as the workspace, and the hub's `fs.watch` capability is
+// pane-scoped (its ${agentCwd} grant only resolves for webview pane tokens), so
+// a sidecar calling it gets "filesystem-scoped capability granted with no
+// roots". Bus `fs.changed` events are still honoured as an extra trigger source.
 
 const TEST_COMMAND = (settings.testCommand && String(settings.testCommand)) || 'npm test';
 const DEBOUNCE_MS = Number.isFinite(Number(settings.debounceMs)) ? Number(settings.debounceMs) : 1500;
@@ -96,8 +102,7 @@ const SOURCE_EXT = new Set([
 ]);
 
 const cwdToSession = new Map(); // resolved root cwd → owning sessionId
-const rootWatched = new Set();  // root cwds we've expanded + started watching
-const watchedDirs = new Set();  // every dir we've asked the host to fs.watch
+const rootWatchers = new Map(); // root cwd → fs.FSWatcher (recursive)
 const debounceTimers = new Map(); // root cwd → pending run timer
 const running = new Set();       // root cwds with a test run in flight
 const rerun = new Set();         // root cwds that changed again mid-run
@@ -113,48 +118,35 @@ function looksLikeSource(p) {
   return SOURCE_EXT.has(base.slice(dot + 1).toLowerCase());
 }
 
-// Enumerate directories under `root` (bounded), skipping ignored ones, so we can
-// watch the whole tree — the host's fs.watch is non-recursive, so one watch per
-// directory is how we get coverage of nested source files. The sidecar runs on
-// the same host as the workspace, so reading the tree directly is safe.
-function collectDirs(root, depth, out, budget) {
-  if (out.length >= budget) return;
-  out.push(root);
-  if (depth <= 0) return;
-  let entries;
-  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return; }
-  for (const e of entries) {
-    if (!e.isDirectory() || IGNORE_DIRS.has(e.name) || e.name.startsWith('.')) continue;
-    collectDirs(path.join(root, e.name), depth - 1, out, budget);
-    if (out.length >= budget) return;
-  }
-}
-
-async function watchDir(dir) {
-  if (watchedDirs.has(dir)) return;
-  watchedDirs.add(dir);
-  try {
-    // Runtime param is { path } (singular); the manifest's paths:["${agentCwd}"]
-    // form is the authorization scope. Confirmed via hubCapabilities.ts + the
-    // desktop web backend's own client.call('fs.watch', { path }).
-    await call('fs.watch', { path: dir });
-  } catch (e) {
-    watchedDirs.delete(dir); // let a later event retry
-    log('fs.watch failed for ' + dir + ': ' + e.message);
-  }
-}
-
-// Learn (or refresh) an agent's cwd → session mapping and begin watching its tree.
+// Learn (or refresh) an agent's cwd → session mapping and begin watching its
+// tree with one recursive local watcher per root.
 async function learnAgent(sessionId, cwd) {
   if (!sessionId || !cwd || typeof cwd !== 'string') return;
   const root = path.resolve(cwd);
   cwdToSession.set(root, sessionId);
-  if (rootWatched.has(root)) return;
-  rootWatched.add(root);
-  const dirs = [];
-  collectDirs(root, 6, dirs, 800);
-  log('watching ' + dirs.length + ' dir(s) under ' + root + ' for session ' + sessionId);
-  for (const d of dirs) await watchDir(d);
+  if (rootWatchers.has(root)) return;
+  try {
+    const w = fs.watch(root, { recursive: true }, (_eventType, filename) => {
+      if (!filename) return;
+      const p = path.join(root, String(filename));
+      if (isIgnoredPath(p) || !looksLikeSource(p)) return;
+      scheduleRun(root);
+    });
+    w.on('error', (e) => {
+      log('watcher error for ' + root + ': ' + e.message);
+      try { w.close(); } catch {}
+      rootWatchers.delete(root); // a later event re-arms it
+    });
+    rootWatchers.set(root, w);
+    log('watching ' + root + ' (recursive) for session ' + sessionId);
+  } catch (e) {
+    log('fs.watch failed for ' + root + ': ' + e.message);
+  }
+}
+
+function unwatchRoot(root) {
+  const w = rootWatchers.get(root);
+  if (w) { try { w.close(); } catch {} rootWatchers.delete(root); }
 }
 
 // Which known root cwd owns this changed path? Longest-prefix wins.
@@ -241,10 +233,14 @@ async function onEvent(event) {
     // notify. `agent.state_changed` carries { sessionId, hookEvent, mode, cwd };
     // `agent.snapshot` (if the host emits it) is a per-session snapshot.
     await learnAgent(d.sessionId, d.cwd);
-    // Drop the mapping when a session ends so stale cwds don't get messaged.
+    // Drop the mapping + watcher when a session ends so stale cwds don't get
+    // messaged or keep a watcher alive.
     if (d.sessionId && d.cwd && /^SessionEnd/i.test(String(d.hookEvent || ''))) {
       const root = path.resolve(d.cwd);
-      if (cwdToSession.get(root) === d.sessionId) cwdToSession.delete(root);
+      if (cwdToSession.get(root) === d.sessionId) {
+        cwdToSession.delete(root);
+        unwatchRoot(root);
+      }
     }
     return;
   }
@@ -270,7 +266,7 @@ const server = http.createServer((req, res) => {
     + ' · subscribed to ' + (TOPICS.join(', ') || '(nothing)') + '</p>'
     + '<p style="color:var(--wks-text-muted,#888);font-size:.75rem">command <code>'
     + escapeHtml(TEST_COMMAND) + '</code> · debounce ' + DEBOUNCE_MS + 'ms · watching '
-    + watchedDirs.size + ' dir(s) across ' + cwdToSession.size + ' agent tree(s)</p>'
+    + rootWatchers.size + ' of ' + cwdToSession.size + ' agent tree(s)</p>'
     + '<pre style="font-size:.72rem;color:var(--wks-text-secondary,#bbb);white-space:pre-wrap">'
     + (Array.from(cwdToSession.entries())
         .map(([c, s]) => escapeHtml(path.basename(c) + '  [' + s + ']  ' + (lastResult.get(c) || 'idle')))
