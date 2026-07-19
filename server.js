@@ -8,64 +8,24 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const { connect } = require('./wks.js');
 
 const DIR = __dirname;
 const manifest = JSON.parse(fs.readFileSync(path.join(DIR, 'plugin.json'), 'utf8'));
 const PORT = Number(process.env.PORT || (manifest.server && manifest.server.port) || 9200);
 
-// The hub injects the bus URL + this plugin's scoped token. Accept the common
-// conventions so the scaffold runs however your hub wires it.
-const BUS_URL = process.env.WKS_BUS_URL || 'ws://127.0.0.1:7895/bus';
-function readToken() {
-  if (process.env.WKS_BUS_TOKEN) return process.env.WKS_BUS_TOKEN;
-  try { return fs.readFileSync(path.join(DIR, '.bus-token'), 'utf8').trim(); } catch { return ''; }
-}
-// Host-injected settings (from manifest `settings`), passed as JSON in env.
-let settings = {};
-try { settings = JSON.parse(process.env.WKS_SETTINGS || '{}'); } catch {}
+// The workspacer plugin SDK (vendored wks.js): connect to the hub bus (scoped
+// token, auto-subscribe, reconnect loop) and expose ready/on/call/publish/settings.
+const wks = connect({ source: manifest.id });
+const settings = wks.settings;
 
 const TOPICS = manifest.consumes || [];
 const recent = [];
-let ws = null, connected = false, callSeq = 0;
-const pending = new Map();
 
 function log(msg) {
   console.log('[' + manifest.id + '] ' + msg);
   recent.unshift(new Date().toISOString() + '  ' + msg);
   if (recent.length > 100) recent.pop();
-}
-
-// Call a hub capability (must be declared in plugin.json `capabilities`).
-function call(method, params) {
-  return new Promise((resolve, reject) => {
-    if (!connected) return reject(new Error('not connected'));
-    const id = 'c' + (++callSeq);
-    pending.set(id, { resolve, reject });
-    ws.send(JSON.stringify({ op: 'call', id, method, params: params || {} }));
-    setTimeout(() => { if (pending.has(id)) { pending.delete(id); reject(new Error('timeout')); } }, 8000);
-  });
-}
-// Publish an event/command (must be declared in `emits`).
-function publish(type, data) {
-  if (connected) ws.send(JSON.stringify({ op: 'publish', event: { type, source: manifest.id, data: data || {} } }));
-}
-
-function connect() {
-  const tok = readToken();
-  ws = new WebSocket(BUS_URL + (tok ? '?token=' + encodeURIComponent(tok) : ''));
-  ws.addEventListener('open', () => {
-    connected = true;
-    if (TOPICS.length) ws.send(JSON.stringify({ op: 'subscribe', topics: TOPICS }));
-    log('connected; subscribed to ' + (TOPICS.join(', ') || '(nothing)'));
-  });
-  ws.addEventListener('message', (ev) => {
-    let f; try { f = JSON.parse(ev.data); } catch { return; }
-    if (f.op === 'event' && f.event) onEvent(f.event).catch((e) => log('onEvent error: ' + e.message));
-    else if (f.op === 'result' && pending.has(f.id)) { pending.get(f.id).resolve(f.result); pending.delete(f.id); }
-    else if (f.op === 'error' && pending.has(f.id)) { pending.get(f.id).reject(new Error(f.error)); pending.delete(f.id); }
-  });
-  ws.addEventListener('close', () => { connected = false; setTimeout(connect, 1500); });
-  ws.addEventListener('error', () => { try { ws.close(); } catch {} });
 }
 
 // ── test-on-save logic ────────────────────────────────────────────────────────
@@ -205,7 +165,7 @@ async function reportFailure(root, code, stdout, stderr) {
     'Please fix the failing tests. Output tail:\n\n' + (tail || '(no output captured)');
   if (sessionId) {
     try {
-      await call('agents.sendMessage', { sessionId, text });
+      await wks.call('agents.sendMessage', { sessionId, text });
       log('sent failure to session ' + sessionId);
     } catch (e) {
       // Agent may not be at an input prompt (busy/dialog/ended) — that's fine,
@@ -216,7 +176,7 @@ async function reportFailure(root, code, stdout, stderr) {
     log('no session mapped for ' + root + '; skipping sendMessage');
   }
   try {
-    await call('notifications.post', {
+    await wks.call('notifications.post', {
       title: 'Tests failed',
       body: TEST_COMMAND + ' — ' + path.basename(root) + ' (exit ' + code + ')',
     });
@@ -262,7 +222,7 @@ const server = http.createServer((req, res) => {
     + 'background:var(--wks-bg-base,#161616);color:var(--wks-text-primary,#e8e8e8);margin:0;padding:14px">'
     + '<h2 style="font-size:1rem">' + manifest.name + '</h2>'
     + '<p style="color:var(--wks-text-muted,#888);font-size:.8rem">'
-    + (connected ? '\u{1F7E2} connected to hub' : '\u{1F534} disconnected')
+    + (wks.connected ? '\u{1F7E2} connected to hub' : '\u{1F534} disconnected')
     + ' · subscribed to ' + (TOPICS.join(', ') || '(nothing)') + '</p>'
     + '<p style="color:var(--wks-text-muted,#888);font-size:.75rem">command <code>'
     + escapeHtml(TEST_COMMAND) + '</code> · debounce ' + DEBOUNCE_MS + 'ms · watching '
@@ -276,4 +236,8 @@ const server = http.createServer((req, res) => {
 });
 function escapeHtml(s) { return String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
 server.listen(PORT, '127.0.0.1', () => log('pane on http://127.0.0.1:' + PORT));
-connect();
+
+// Route each consumed bus event to onEvent (the SDK subscribes to '*'; we
+// dispatch only the topics this plugin declares in plugin.json `consumes`).
+for (const t of TOPICS) wks.on(t, (_data, ev) => { onEvent(ev).catch((e) => log('onEvent error: ' + e.message)); });
+wks.ready.then(() => log('connected; subscribed to ' + (TOPICS.join(', ') || '(nothing)')));
