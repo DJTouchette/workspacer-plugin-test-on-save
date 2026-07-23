@@ -2,7 +2,7 @@
   "id": "djtouchette.test-on-save",
   "name": "Test on Save",
   "apiVersion": "1",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "server": {
     "command": "node",
     "args": [
@@ -34,11 +34,20 @@
       "type": "number",
       "default": 1500,
       "help": "Wait this long after the last change before running."
+    },
+    {
+      "key": "notify",
+      "label": "Notification center updates",
+      "type": "boolean",
+      "default": true,
+      "help": "Post fail/recover updates to the in-app notification center (one slot per project)."
     }
   ],
   "capabilities": [
-    "agents.sendMessage",
-    "notifications.post"
+    "agents.sendMessage"
+  ],
+  "emits": [
+    "notify.post"
   ],
   "consumes": [
     "fs.changed",

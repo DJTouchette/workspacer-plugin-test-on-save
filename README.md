@@ -29,21 +29,42 @@ Concretely:
    `debounceMs`, then runs `testCommand` via `child_process.exec` in that cwd.
    Overlapping runs are coalesced (a change during a run re-runs afterwards).
 4. **Report failures.** Non-zero exit → `agents.sendMessage({ sessionId, text })`
-   with the last ~4 KB of output to the owning agent, and `notifications.post`.
-   The mapping + watcher are dropped on `SessionEnd` so stale cwds aren't messaged.
+   with the last ~4 KB of output to the owning agent, plus a `notify.post` event
+   (see below). The mapping + watcher are dropped on `SessionEnd` so stale cwds
+   aren't messaged.
+
+## Notifications (v1.1)
+
+The plugin feeds the in-app notification center via the lightweight
+**`notify.post` event** (fire-and-forget; toast + bell in-app, escalating to an
+OS notification only when the workspacer window is unfocused — deliberately the
+low-noise path, since this plugin can fire on every save):
+
+- **Suite fails** → a `level: 'error'` entry with the fail count and the first
+  failing line from the output, tagged with the owning agent's `sessionId`
+  (clicking it focuses that agent) and `key: test-on-save:<cwd>` — a repeated
+  failure in the same project **replaces** the previous entry (one slot per
+  project, never a stack).
+- **Suite passes after having failed** → a `level: 'success'` entry with the
+  **same key**, replacing the red entry. Passing runs with no prior failure post
+  nothing.
+
+Turn it off with the **`notify`** setting (boolean, default `true`).
 
 ## Bus wiring
 
 - **Subscribes to:** `fs.changed`, `agent.state_changed`, `agent.snapshot`
   (the last two were **added to the manifest** to discover live agents' cwds →
   sessionIds; without them there is no way to map a file change back to an agent).
-- **Calls capabilities:** `agents.sendMessage` (`{ sessionId, text }`) and
-  `notifications.post` (`{ title, body }`).
-- **Emits:** —
+- **Calls capabilities:** `agents.sendMessage` (`{ sessionId, text }`).
+- **Emits:** `notify.post` (fail/recover updates for the in-app notification
+  center).
 - **Settings:**
 - `testCommand` (string, default `npm test`) — Command run on change, in the cwd.
 - `debounceMs` (number, default `1500`) — Wait this long after the last change
   before running.
+- `notify` (boolean, default `true`) — Post fail/recover updates to the
+  notification center.
 
 ## Run it
 

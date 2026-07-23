@@ -34,7 +34,8 @@ function log(msg) {
 // `agent.snapshot`), watch that working tree, and when a source file under it
 // changes, debounce per-cwd then run `settings.testCommand` in the cwd. On a
 // non-zero exit we push the failing tail back to the owning agent with
-// `agents.sendMessage` and raise an OS notification via `notifications.post`.
+// `agents.sendMessage` and publish a `notify.post` event (red, per-cwd key);
+// when the suite recovers, a green `notify.post` with the SAME key replaces it.
 //
 // Watching is done LOCALLY with node's recursive fs.watch: the sidecar runs on
 // the same host as the workspace, and the hub's `fs.watch` capability is
@@ -44,6 +45,7 @@ function log(msg) {
 
 const TEST_COMMAND = (settings.testCommand && String(settings.testCommand)) || 'npm test';
 const DEBOUNCE_MS = Number.isFinite(Number(settings.debounceMs)) ? Number(settings.debounceMs) : 1500;
+const NOTIFY = settings.notify !== false; // in-app notification center feed (default on)
 const RUN_TIMEOUT_MS = 10 * 60 * 1000; // hard cap so a hung test run can't wedge a cwd
 const TAIL_CHARS = 4000; // how much failing output we feed back to the agent
 
@@ -67,6 +69,7 @@ const debounceTimers = new Map(); // root cwd → pending run timer
 const running = new Set();       // root cwds with a test run in flight
 const rerun = new Set();         // root cwds that changed again mid-run
 const lastResult = new Map();    // root cwd → short human status (for the pane)
+const failedRoots = new Set();   // root cwds whose last run failed (drives the green "fixed" notify)
 
 function isIgnoredPath(p) {
   return p.split(/[\\/]/).some((seg) => IGNORE_DIRS.has(seg));
@@ -146,14 +149,58 @@ function runTests(root) {
     if (!failed) {
       lastResult.set(root, 'passed ✔ (' + new Date().toISOString() + ')');
       log('tests passed in ' + root);
+      // Green notify ONLY if this cwd was previously red: same key, so the
+      // success entry REPLACES the failure entry in the notification center.
+      if (failedRoots.delete(root)) {
+        postNotify({
+          level: 'success',
+          title: 'Tests passing again — ' + path.basename(root),
+          body: TEST_COMMAND + ' passed in ' + root,
+          sessionId: cwdToSession.get(root) || undefined,
+          key: 'test-on-save:' + root,
+        });
+      }
     } else {
       const code = err.killed ? 'timeout/killed' : (err.code != null ? err.code : 'error');
       lastResult.set(root, 'FAILED (exit ' + code + ') ' + new Date().toISOString());
       log('tests FAILED (exit ' + code + ') in ' + root);
+      failedRoots.add(root);
       reportFailure(root, code, stdout || '', stderr || '');
     }
     if (rerun.delete(root)) scheduleRun(root); // a change landed while we ran
   });
+}
+
+// Lighter notification path: publish a `notify.post` EVENT (fire-and-forget)
+// instead of calling the `notifications.post` capability. It lands in the
+// in-app notification center + toast on every UI client and only escalates to
+// an OS notification when the app window is unfocused — right for a plugin
+// that can fire on every save. `key` is per-cwd so a repeat REPLACES the
+// previous entry: one slot per project, never a stack. Gated by the `notify`
+// setting (default on).
+function postNotify(data) {
+  if (!NOTIFY) return;
+  try {
+    wks.publish('notify.post', { source: 'plugin:' + manifest.id, ...data });
+    log('notify.post [' + (data.level || 'info') + '] ' + data.title);
+  } catch (e) {
+    log('notify.post publish failed: ' + e.message);
+  }
+}
+
+// Pull a human summary out of the test output: a failing-test count (jest/mocha/
+// vitest/pytest/go/cargo-style "N failed"/"N failing") and the first line that
+// mentions a failure. Both best-effort — the caller falls back to the exit code.
+function failureSummary(output) {
+  const m = output.match(/(\d+)\s+fail(?:ed|ing|ures?)?\b/i);
+  const count = m ? parseInt(m[1], 10) : null;
+  let firstLine = '';
+  for (const line of output.split('\n')) {
+    const t = line.trim();
+    if (t && /\bfail(?:s|ed|ing|ure|ures)?\b|\bFAIL\b|✕|✗|not ok/i.test(t)) { firstLine = t; break; }
+  }
+  if (firstLine.length > 160) firstLine = firstLine.slice(0, 159) + '…';
+  return { count, firstLine };
 }
 
 async function reportFailure(root, code, stdout, stderr) {
@@ -175,14 +222,15 @@ async function reportFailure(root, code, stdout, stderr) {
   } else {
     log('no session mapped for ' + root + '; skipping sendMessage');
   }
-  try {
-    await wks.call('notifications.post', {
-      title: 'Tests failed',
-      body: TEST_COMMAND + ' — ' + path.basename(root) + ' (exit ' + code + ')',
-    });
-  } catch (e) {
-    log('notifications.post failed: ' + e.message);
-  }
+  const summary = failureSummary(combined);
+  postNotify({
+    level: 'error',
+    title: 'Tests failed — ' + path.basename(root),
+    body: (summary.count != null ? summary.count + ' failing · ' : '')
+      + (summary.firstLine || TEST_COMMAND + ' exited ' + code),
+    sessionId: sessionId || undefined,
+    key: 'test-on-save:' + root,
+  });
 }
 
 async function onEvent(event) {
@@ -199,6 +247,7 @@ async function onEvent(event) {
       const root = path.resolve(d.cwd);
       if (cwdToSession.get(root) === d.sessionId) {
         cwdToSession.delete(root);
+        failedRoots.delete(root);
         unwatchRoot(root);
       }
     }
